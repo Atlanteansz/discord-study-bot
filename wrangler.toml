@@ -9,7 +9,7 @@ ENVIRONMENT = "production"
 [[d1_databases]]
 binding = "DB"
 database_name = "study-bot-db"
-database_id = "placeholder-replace-with-your-database-id"
+database_id = "211c5a98-a3b2-41a8-a2c8-34ff98da4fde"
 
 [triggers]
 crons = ["* * * * *"]
