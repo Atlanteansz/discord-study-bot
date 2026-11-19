@@ -5,3 +5,11 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 ENVIRONMENT = "production"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "study-bot-db"
+database_id = "placeholder-replace-with-your-database-id"
+
+[triggers]
+crons = ["* * * * *"]
