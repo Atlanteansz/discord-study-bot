@@ -1,0 +1,1 @@
+ALTER TABLE deadlines ADD COLUMN is_completed INTEGER NOT NULL DEFAULT 0;
