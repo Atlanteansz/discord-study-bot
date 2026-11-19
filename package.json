@@ -1,0 +1,9 @@
+{
+  "name": "discord-study-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test src/test.js",
+    "register": "node scripts/register.js"
+  }
+}
