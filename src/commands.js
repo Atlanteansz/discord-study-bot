@@ -10,6 +10,9 @@ import {
   getDeadlineById,
   completeDeadline,
   deleteDeadline,
+  getGuildConfig,
+  upsertGuildConfig,
+  clearGuildConfigSetting,
   insertReminder
 } from "./db.js";
 import { findQuestionById, getRandomQuestion } from "./questions.js";
@@ -152,6 +155,81 @@ export const COMMAND_DEFINITIONS = [
     ]
   },
   {
+    name: "config",
+    description: "Manage server alert settings and notification roles",
+    default_member_permissions: "32",
+    options: [
+      {
+        type: 1,
+        name: "set",
+        description: "Configure deadline alert roles and channels",
+        options: [
+          {
+            type: 8,
+            name: "due_soon_role",
+            description: "Role to ping for early deadline alerts",
+            required: false
+          },
+          {
+            type: 8,
+            name: "overdue_role",
+            description: "Role to ping when a deadline becomes overdue",
+            required: false
+          },
+          {
+            type: 7,
+            name: "alert_channel",
+            description: "Channel to post alerts to (falls back to deadline channel)",
+            channel_types: [0, 5],
+            required: false
+          },
+          {
+            type: 4,
+            name: "due_soon_minutes",
+            description: "Minutes before due date to send early alert (15 to 1440, default 60)",
+            min_value: 15,
+            max_value: 1440,
+            required: false
+          },
+          {
+            type: 4,
+            name: "second_alert_hours",
+            description: "Hours before due date for an extra early alert (1 to 168, optional)",
+            min_value: 1,
+            max_value: 168,
+            required: false
+          }
+        ]
+      },
+      {
+        type: 1,
+        name: "view",
+        description: "View current server alert settings"
+      },
+      {
+        type: 1,
+        name: "clear",
+        description: "Remove a server alert setting or reset all",
+        options: [
+          {
+            type: 3,
+            name: "setting",
+            description: "Setting to remove",
+            required: true,
+            choices: [
+              { name: "Due Soon Role", value: "due_soon_role" },
+              { name: "Overdue Role", value: "overdue_role" },
+              { name: "Alert Channel", value: "alert_channel" },
+              { name: "Due Soon Minutes", value: "due_soon_minutes" },
+              { name: "Second Alert Hours", value: "second_alert_hours" },
+              { name: "All Settings", value: "all" }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
     name: "remind",
     description: "Set a study reminder",
     options: [
@@ -245,6 +323,21 @@ export function handleHelpCommand() {
             {
               name: "/deadline delete",
               value: "Delete a deadline. Only the creator or members with Manage Server can delete.",
+              inline: false
+            },
+            {
+              name: "/config set",
+              value: "Configure notification roles (due_soon_role, overdue_role), alert channel, and alert timings (Manage Server required).",
+              inline: false
+            },
+            {
+              name: "/config view",
+              value: "View current server notification and alert settings.",
+              inline: false
+            },
+            {
+              name: "/config clear",
+              value: "Clear a server alert setting or reset all settings to default.",
               inline: false
             },
             {
@@ -621,6 +714,264 @@ export async function handleDeadlineCommand(interaction, db) {
     type: RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
     data: {
       content: "Invalid deadline subcommand.",
+      flags: 64
+    }
+  };
+}
+
+export async function handleConfigCommand(interaction, db) {
+  const guildCheck = requireGuild(interaction);
+  if (guildCheck) {
+    return guildCheck;
+  }
+
+  if (!checkManageGuild(interaction.member?.permissions)) {
+    return {
+      type: RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+      data: {
+        embeds: [
+          {
+            title: "Permission Denied",
+            description: "You need the Manage Server permission to configure Study Bot settings.",
+            color: COLOR.DANGER,
+            footer: { text: "Study Bot • Asia/Manila (UTC+8)" }
+          }
+        ],
+        flags: 64
+      }
+    };
+  }
+
+  if (!db) {
+    return {
+      type: RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+      data: {
+        embeds: [
+          {
+            title: "Database Unavailable",
+            description: "D1 database binding DB is not configured.",
+            color: COLOR.DANGER,
+            footer: { text: "Study Bot • Asia/Manila (UTC+8)" }
+          }
+        ],
+        flags: 64
+      }
+    };
+  }
+
+  const subcommand = interaction.data?.options?.[0];
+  const subName = subcommand?.name;
+  const options = getOptionMap(subcommand?.options);
+
+  if (subName === "set") {
+    const hasAnyOption =
+      options.due_soon_role !== undefined ||
+      options.overdue_role !== undefined ||
+      options.alert_channel !== undefined ||
+      options.due_soon_minutes !== undefined ||
+      options.second_alert_hours !== undefined;
+
+    if (!hasAnyOption) {
+      return {
+        type: RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+        data: {
+          embeds: [
+            {
+              title: "No Settings Provided",
+              description: "Please specify at least one option to update.",
+              color: COLOR.DANGER,
+              footer: { text: "Study Bot • Asia/Manila (UTC+8)" }
+            }
+          ],
+          flags: 64
+        }
+      };
+    }
+
+    if (
+      options.due_soon_role === interaction.guild_id ||
+      options.overdue_role === interaction.guild_id
+    ) {
+      return {
+        type: RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+        data: {
+          embeds: [
+            {
+              title: "Invalid Role",
+              description: "The @everyone role cannot be used for alert pings. Please select a specific role.",
+              color: COLOR.DANGER,
+              footer: { text: "Study Bot • Asia/Manila (UTC+8)" }
+            }
+          ],
+          flags: 64
+        }
+      };
+    }
+
+    if (options.due_soon_minutes !== undefined) {
+      const m = Number(options.due_soon_minutes);
+      if (!Number.isInteger(m) || m < 15 || m > 1440) {
+        return {
+          type: RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: {
+            embeds: [
+              {
+                title: "Invalid Parameter",
+                description: "due_soon_minutes must be an integer between 15 and 1440.",
+                color: COLOR.DANGER,
+                footer: { text: "Study Bot • Asia/Manila (UTC+8)" }
+              }
+            ],
+            flags: 64
+          }
+        };
+      }
+    }
+
+    if (options.second_alert_hours !== undefined) {
+      const h = Number(options.second_alert_hours);
+      if (!Number.isInteger(h) || h < 1 || h > 168) {
+        return {
+          type: RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+          data: {
+            embeds: [
+              {
+                title: "Invalid Parameter",
+                description: "second_alert_hours must be an integer between 1 and 168.",
+                color: COLOR.DANGER,
+                footer: { text: "Study Bot • Asia/Manila (UTC+8)" }
+              }
+            ],
+            flags: 64
+          }
+        };
+      }
+    }
+
+    const existing = await getGuildConfig(db, interaction.guild_id);
+    const dueSoonRole = options.due_soon_role !== undefined ? options.due_soon_role : existing?.due_soon_role;
+    const overdueRole = options.overdue_role !== undefined ? options.overdue_role : existing?.overdue_role;
+    const alertChannel = options.alert_channel !== undefined ? options.alert_channel : existing?.alert_channel;
+    const dueSoonMinutes = options.due_soon_minutes !== undefined ? Number(options.due_soon_minutes) : (existing?.due_soon_minutes || 60);
+    const secondAlertHours = options.second_alert_hours !== undefined ? Number(options.second_alert_hours) : existing?.second_alert_hours;
+
+    await upsertGuildConfig(db, {
+      guildId: interaction.guild_id,
+      dueSoonRole,
+      overdueRole,
+      alertChannel,
+      dueSoonMinutes,
+      secondAlertHours
+    });
+
+    return {
+      type: RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+      data: {
+        embeds: [
+          {
+            title: "Server Configuration Updated",
+            color: COLOR.SUCCESS,
+            fields: [
+              {
+                name: "Due Soon Role",
+                value: dueSoonRole ? `<@&${dueSoonRole}>` : "Not set (no ping)",
+                inline: true
+              },
+              {
+                name: "Overdue Role",
+                value: overdueRole ? `<@&${overdueRole}>` : "Not set (no ping)",
+                inline: true
+              },
+              {
+                name: "Alert Channel",
+                value: alertChannel ? `<#${alertChannel}>` : "Not set (falls back to deadline channel)",
+                inline: false
+              },
+              {
+                name: "Due Soon Alert",
+                value: `${dueSoonMinutes} minutes before due`,
+                inline: true
+              },
+              {
+                name: "Second Alert",
+                value: secondAlertHours ? `${secondAlertHours} hours before due` : "Disabled",
+                inline: true
+              }
+            ],
+            footer: { text: "Study Bot • Asia/Manila (UTC+8)" }
+          }
+        ]
+      }
+    };
+  }
+
+  if (subName === "view") {
+    const config = await getGuildConfig(db, interaction.guild_id);
+
+    return {
+      type: RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+      data: {
+        embeds: [
+          {
+            title: "Server Alert Configuration",
+            color: COLOR.PRIMARY,
+            fields: [
+              {
+                name: "Due Soon Role",
+                value: config?.due_soon_role ? `<@&${config.due_soon_role}>` : "Not set (no ping)",
+                inline: true
+              },
+              {
+                name: "Overdue Role",
+                value: config?.overdue_role ? `<@&${config.overdue_role}>` : "Not set (no ping)",
+                inline: true
+              },
+              {
+                name: "Alert Channel",
+                value: config?.alert_channel ? `<#${config.alert_channel}>` : "Not set (falls back to deadline channel)",
+                inline: false
+              },
+              {
+                name: "Due Soon Alert",
+                value: `${config?.due_soon_minutes || 60} minutes before due`,
+                inline: true
+              },
+              {
+                name: "Second Alert",
+                value: config?.second_alert_hours ? `${config.second_alert_hours} hours before due` : "Disabled",
+                inline: true
+              }
+            ],
+            footer: { text: "Study Bot • Asia/Manila (UTC+8)" }
+          }
+        ]
+      }
+    };
+  }
+
+  if (subName === "clear") {
+    const setting = options.setting;
+    await clearGuildConfigSetting(db, interaction.guild_id, setting);
+
+    return {
+      type: RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+      data: {
+        embeds: [
+          {
+            title: "Configuration Cleared",
+            description: setting === "all" ? "Reset all server alert configurations to defaults." : `Cleared setting: **${setting}**.`,
+            color: COLOR.SUCCESS,
+            footer: { text: "Study Bot • Asia/Manila (UTC+8)" }
+          }
+        ]
+      }
+    };
+  }
+
+  return {
+    type: RESPONSE_TYPE.CHANNEL_MESSAGE_WITH_SOURCE,
+    data: {
+      content: "Invalid config subcommand.",
       flags: 64
     }
   };
@@ -1043,6 +1394,9 @@ export async function handleInteraction(interaction, env) {
     }
     if (name === "deadline") {
       return await handleDeadlineCommand(interaction, env?.DB);
+    }
+    if (name === "config") {
+      return await handleConfigCommand(interaction, env?.DB);
     }
     if (name === "remind") {
       return await handleRemindCommand(interaction, env?.DB);

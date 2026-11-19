@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker from "./index.js";
+import worker, { processDeadlineAlerts } from "./index.js";
 import { verifyDiscordRequest } from "./verify.js";
 import {
   parseManilaDateTime,
@@ -34,10 +34,12 @@ async function createKeyPairAndSignature(bodyText, timestamp) {
 function createMockDb() {
   const deadlines = [];
   const reminders = [];
+  const guildConfigs = new Map();
 
   return {
     deadlines,
     reminders,
+    guildConfigs,
     prepare(sql) {
       return {
         bind(...args) {
@@ -55,9 +57,100 @@ function createMockDb() {
                   due_timestamp,
                   is_completed: 0,
                   created_by,
+                  alert_early_sent: 0,
+                  alert_second_sent: 0,
+                  alert_overdue_sent: 0,
+                  alert_failures: 0,
                   created_at
                 });
                 return { success: true, meta: { last_row_id: id, changes: 1 } };
+              }
+              if (sql.startsWith("INSERT INTO guild_configs")) {
+                const [guild_id, due_soon_role, overdue_role, alert_channel, due_soon_minutes, second_alert_hours, updated_at] = args;
+                guildConfigs.set(guild_id, {
+                  guild_id,
+                  due_soon_role,
+                  overdue_role,
+                  alert_channel,
+                  due_soon_minutes,
+                  second_alert_hours,
+                  updated_at
+                });
+                return { success: true, meta: { changes: 1 } };
+              }
+              if (sql.startsWith("UPDATE guild_configs SET due_soon_role = NULL")) {
+                const [, guild_id] = args;
+                const c = guildConfigs.get(guild_id);
+                if (c) c.due_soon_role = null;
+                return { success: true, meta: { changes: 1 } };
+              }
+              if (sql.startsWith("UPDATE guild_configs SET overdue_role = NULL")) {
+                const [, guild_id] = args;
+                const c = guildConfigs.get(guild_id);
+                if (c) c.overdue_role = null;
+                return { success: true, meta: { changes: 1 } };
+              }
+              if (sql.startsWith("UPDATE guild_configs SET alert_channel = NULL")) {
+                const [, guild_id] = args;
+                const c = guildConfigs.get(guild_id);
+                if (c) c.alert_channel = null;
+                return { success: true, meta: { changes: 1 } };
+              }
+              if (sql.startsWith("UPDATE guild_configs SET due_soon_minutes = 60")) {
+                const [, guild_id] = args;
+                const c = guildConfigs.get(guild_id);
+                if (c) c.due_soon_minutes = 60;
+                return { success: true, meta: { changes: 1 } };
+              }
+              if (sql.startsWith("UPDATE guild_configs SET second_alert_hours = NULL")) {
+                const [, guild_id] = args;
+                const c = guildConfigs.get(guild_id);
+                if (c) c.second_alert_hours = null;
+                return { success: true, meta: { changes: 1 } };
+              }
+              if (sql.startsWith("DELETE FROM guild_configs WHERE guild_id = ?")) {
+                const [guild_id] = args;
+                guildConfigs.delete(guild_id);
+                return { success: true, meta: { changes: 1 } };
+              }
+              if (sql.startsWith("UPDATE deadlines SET alert_early_sent = COALESCE")) {
+                const [earlySent, secondSent, overdueSent, id] = args;
+                const d = deadlines.find((x) => x.id === id);
+                if (d) {
+                  if (earlySent !== null) d.alert_early_sent = earlySent;
+                  if (secondSent !== null) d.alert_second_sent = secondSent;
+                  if (overdueSent !== null) d.alert_overdue_sent = overdueSent;
+                  d.alert_failures = 0;
+                  return { success: true, meta: { changes: 1 } };
+                }
+                return { success: true, meta: { changes: 0 } };
+              }
+              if (sql.startsWith("UPDATE deadlines SET alert_failures = alert_failures + 1")) {
+                const [id] = args;
+                const d = deadlines.find((x) => x.id === id);
+                if (d) {
+                  d.alert_failures++;
+                  return { success: true, meta: { changes: 1 } };
+                }
+                return { success: true, meta: { changes: 0 } };
+              }
+              if (sql.startsWith("UPDATE deadlines SET alert_overdue_sent = 1")) {
+                const [id] = args;
+                const d = deadlines.find((x) => x.id === id);
+                if (d) d.alert_overdue_sent = 1;
+                return { success: true, meta: { changes: 1 } };
+              }
+              if (sql.startsWith("UPDATE deadlines SET alert_early_sent = 1")) {
+                const [id] = args;
+                const d = deadlines.find((x) => x.id === id);
+                if (d) d.alert_early_sent = 1;
+                return { success: true, meta: { changes: 1 } };
+              }
+              if (sql.startsWith("UPDATE deadlines SET alert_second_sent = 1")) {
+                const [id] = args;
+                const d = deadlines.find((x) => x.id === id);
+                if (d) d.alert_second_sent = 1;
+                return { success: true, meta: { changes: 1 } };
               }
               if (sql.startsWith("INSERT INTO reminders")) {
                 const [user_id, channel_id, message, remind_timestamp, created_at] = args;
@@ -107,6 +200,10 @@ function createMockDb() {
                 const [id, guild_id] = args;
                 return deadlines.find((d) => d.id === id && d.guild_id === guild_id) || null;
               }
+              if (sql.includes("FROM guild_configs WHERE guild_id = ?")) {
+                const [guild_id] = args;
+                return guildConfigs.get(guild_id) || null;
+              }
               return null;
             },
             async all() {
@@ -134,6 +231,13 @@ function createMockDb() {
                 const [guild_id, limit] = args;
                 const matches = deadlines
                   .filter((d) => d.guild_id === guild_id && d.is_completed === 0)
+                  .slice(0, limit);
+                return { results: matches };
+              }
+              if (sql.includes("FROM deadlines WHERE is_completed = 0 AND (alert_overdue_sent = 0 OR alert_early_sent = 0)")) {
+                const [limit] = args;
+                const matches = deadlines
+                  .filter((d) => d.is_completed === 0 && (d.alert_overdue_sent === 0 || d.alert_early_sent === 0) && d.alert_failures < 3)
                   .slice(0, limit);
                 return { results: matches };
               }
@@ -175,6 +279,380 @@ test("every command and subcommand places required options before optional ones"
     if (cmd.options) {
       validateOptionOrder(cmd.options, cmd.name);
     }
+  }
+});
+
+test("/config commands reject execution outside a Discord server", async () => {
+  const interaction = {
+    type: 2,
+    data: {
+      name: "config",
+      options: [{ name: "view", type: 1 }]
+    }
+  };
+
+  const response = await handleInteraction(interaction, {});
+  assert.equal(response.type, 4);
+  assert.equal(response.data.embeds[0].title, "Server Only Command");
+});
+
+test("/config commands reject users without Manage Server permission", async () => {
+  const interaction = {
+    type: 2,
+    guild_id: "guild_abc",
+    data: {
+      name: "config",
+      options: [{ name: "view", type: 1 }]
+    },
+    member: { permissions: "0" }
+  };
+
+  const response = await handleInteraction(interaction, {});
+  assert.equal(response.type, 4);
+  assert.equal(response.data.embeds[0].title, "Permission Denied");
+});
+
+test("/config set rejects @everyone role", async () => {
+  const mockDb = createMockDb();
+  const interaction = {
+    type: 2,
+    guild_id: "guild_abc",
+    data: {
+      name: "config",
+      options: [
+        {
+          name: "set",
+          type: 1,
+          options: [{ name: "due_soon_role", value: "guild_abc" }]
+        }
+      ]
+    },
+    member: { permissions: "32" }
+  };
+
+  const response = await handleInteraction(interaction, { DB: mockDb });
+  assert.equal(response.type, 4);
+  assert.equal(response.data.embeds[0].title, "Invalid Role");
+  assert.match(response.data.embeds[0].description, /@everyone/);
+});
+
+test("/config set rejects invocation with no options provided", async () => {
+  const mockDb = createMockDb();
+  const interaction = {
+    type: 2,
+    guild_id: "guild_abc",
+    data: {
+      name: "config",
+      options: [{ name: "set", type: 1, options: [] }]
+    },
+    member: { permissions: "32" }
+  };
+
+  const response = await handleInteraction(interaction, { DB: mockDb });
+  assert.equal(response.type, 4);
+  assert.equal(response.data.embeds[0].title, "No Settings Provided");
+});
+
+test("/config set saves configuration and /config view renders it with mentions", async () => {
+  const mockDb = createMockDb();
+  const setInteraction = {
+    type: 2,
+    guild_id: "guild_abc",
+    data: {
+      name: "config",
+      options: [
+        {
+          name: "set",
+          type: 1,
+          options: [
+            { name: "due_soon_role", value: "role_111" },
+            { name: "overdue_role", value: "role_222" },
+            { name: "alert_channel", value: "channel_333" },
+            { name: "due_soon_minutes", value: 30 },
+            { name: "second_alert_hours", value: 12 }
+          ]
+        }
+      ]
+    },
+    member: { permissions: "32" }
+  };
+
+  const setResponse = await handleInteraction(setInteraction, { DB: mockDb });
+  assert.equal(setResponse.type, 4);
+  assert.equal(setResponse.data.embeds[0].title, "Server Configuration Updated");
+
+  const viewInteraction = {
+    type: 2,
+    guild_id: "guild_abc",
+    data: {
+      name: "config",
+      options: [{ name: "view", type: 1 }]
+    },
+    member: { permissions: "32" }
+  };
+
+  const viewResponse = await handleInteraction(viewInteraction, { DB: mockDb });
+  assert.equal(viewResponse.type, 4);
+  const fields = viewResponse.data.embeds[0].fields;
+  assert.match(fields[0].value, /<@&role_111>/);
+  assert.match(fields[1].value, /<@&role_222>/);
+  assert.match(fields[2].value, /<#channel_333>/);
+  assert.match(fields[3].value, /30 minutes/);
+  assert.match(fields[4].value, /12 hours/);
+});
+
+test("/config clear removes a specific setting and all settings", async () => {
+  const mockDb = createMockDb();
+  mockDb.guildConfigs.set("guild_abc", {
+    guild_id: "guild_abc",
+    due_soon_role: "role_111",
+    overdue_role: "role_222",
+    alert_channel: "channel_333",
+    due_soon_minutes: 30,
+    second_alert_hours: 12,
+    updated_at: 1000
+  });
+
+  const clearRoleInteraction = {
+    type: 2,
+    guild_id: "guild_abc",
+    data: {
+      name: "config",
+      options: [
+        {
+          name: "clear",
+          type: 1,
+          options: [{ name: "setting", value: "due_soon_role" }]
+        }
+      ]
+    },
+    member: { permissions: "32" }
+  };
+
+  const clearRoleResp = await handleInteraction(clearRoleInteraction, { DB: mockDb });
+  assert.equal(clearRoleResp.type, 4);
+  assert.equal(mockDb.guildConfigs.get("guild_abc").due_soon_role, null);
+
+  const clearAllInteraction = {
+    type: 2,
+    guild_id: "guild_abc",
+    data: {
+      name: "config",
+      options: [
+        {
+          name: "clear",
+          type: 1,
+          options: [{ name: "setting", value: "all" }]
+        }
+      ]
+    },
+    member: { permissions: "32" }
+  };
+
+  const clearAllResp = await handleInteraction(clearAllInteraction, { DB: mockDb });
+  assert.equal(clearAllResp.type, 4);
+  assert.equal(mockDb.guildConfigs.has("guild_abc"), false);
+});
+
+test("alert timing: early alert dispatches with role mention and restricted allowed_mentions at threshold", async () => {
+  const mockDb = createMockDb();
+  const now = 100000;
+  mockDb.guildConfigs.set("guild_1", {
+    guild_id: "guild_1",
+    due_soon_role: "role_early",
+    overdue_role: "role_overdue",
+    alert_channel: "channel_alert",
+    due_soon_minutes: 60,
+    second_alert_hours: null
+  });
+
+  mockDb.deadlines.push({
+    id: 1,
+    guild_id: "guild_1",
+    channel_id: "channel_orig",
+    course: "CS101",
+    title: "Midterm",
+    due_timestamp: now + 3600,
+    is_completed: 0,
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
+  });
+
+  const originalFetch = globalThis.fetch;
+  let postedUrl = null;
+  let postedBody = null;
+
+  globalThis.fetch = async (url, options) => {
+    postedUrl = url;
+    postedBody = JSON.parse(options.body);
+    return new Response(JSON.stringify({ id: "msg_1" }), { status: 200 });
+  };
+
+  try {
+    await processDeadlineAlerts({ DB: mockDb, DISCORD_TOKEN: "token" }, now);
+    assert.equal(postedUrl, "https://discord.com/api/v10/channels/channel_alert/messages");
+    assert.match(postedBody.content, /<@&role_early>/);
+    assert.deepEqual(postedBody.allowed_mentions, { parse: [], roles: ["role_early"], users: [] });
+    assert.equal(mockDb.deadlines[0].alert_early_sent, 1);
+
+    postedUrl = null;
+    await processDeadlineAlerts({ DB: mockDb, DISCORD_TOKEN: "token" }, now + 60);
+    assert.equal(postedUrl, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("alert timing: overdue alert dispatches when deadline passes and skips prior alerts", async () => {
+  const mockDb = createMockDb();
+  const now = 200000;
+  mockDb.guildConfigs.set("guild_2", {
+    guild_id: "guild_2",
+    due_soon_role: "role_early",
+    overdue_role: "role_overdue",
+    alert_channel: "channel_alert",
+    due_soon_minutes: 60,
+    second_alert_hours: null
+  });
+
+  mockDb.deadlines.push({
+    id: 2,
+    guild_id: "guild_2",
+    channel_id: "channel_orig",
+    course: "NET201",
+    title: "Lab",
+    due_timestamp: now - 10,
+    is_completed: 0,
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
+  });
+
+  const originalFetch = globalThis.fetch;
+  let postedBody = null;
+
+  globalThis.fetch = async (url, options) => {
+    postedBody = JSON.parse(options.body);
+    return new Response(JSON.stringify({ id: "msg_2" }), { status: 200 });
+  };
+
+  try {
+    await processDeadlineAlerts({ DB: mockDb, DISCORD_TOKEN: "token" }, now);
+    assert.match(postedBody.content, /<@&role_overdue>/);
+    assert.match(postedBody.embeds[0].title, /Overdue/);
+    assert.equal(mockDb.deadlines[0].alert_overdue_sent, 1);
+    assert.equal(mockDb.deadlines[0].alert_early_sent, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("alert channel fallback posts to deadline channel when alert_channel is unset", async () => {
+  const mockDb = createMockDb();
+  const now = 100000;
+  mockDb.deadlines.push({
+    id: 3,
+    guild_id: "guild_3",
+    channel_id: "channel_orig_fallback",
+    course: "CS101",
+    title: "Quiz",
+    due_timestamp: now + 1800,
+    is_completed: 0,
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
+  });
+
+  const originalFetch = globalThis.fetch;
+  let postedUrl = null;
+  let postedBody = null;
+
+  globalThis.fetch = async (url, options) => {
+    postedUrl = url;
+    postedBody = JSON.parse(options.body);
+    return new Response(JSON.stringify({ id: "msg_3" }), { status: 200 });
+  };
+
+  try {
+    await processDeadlineAlerts({ DB: mockDb, DISCORD_TOKEN: "token" }, now);
+    assert.equal(postedUrl, "https://discord.com/api/v10/channels/channel_orig_fallback/messages");
+    assert.equal(postedBody.content, "");
+    assert.deepEqual(postedBody.allowed_mentions, { parse: [], roles: [], users: [] });
+    assert.equal(mockDb.deadlines[0].alert_early_sent, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("failed post retries on later ticks and is abandoned after 3 failures without blocking others", async () => {
+  const mockDb = createMockDb();
+  const now = 100000;
+  mockDb.deadlines.push({
+    id: 4,
+    guild_id: "guild_4",
+    channel_id: "broken_channel",
+    course: "CS101",
+    title: "Project",
+    due_timestamp: now + 1800,
+    is_completed: 0,
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("Forbidden", { status: 403 });
+
+  try {
+    await processDeadlineAlerts({ DB: mockDb, DISCORD_TOKEN: "token" }, now);
+    assert.equal(mockDb.deadlines[0].alert_failures, 1);
+    assert.equal(mockDb.deadlines[0].alert_early_sent, 0);
+
+    await processDeadlineAlerts({ DB: mockDb, DISCORD_TOKEN: "token" }, now);
+    assert.equal(mockDb.deadlines[0].alert_failures, 2);
+    assert.equal(mockDb.deadlines[0].alert_early_sent, 0);
+
+    await processDeadlineAlerts({ DB: mockDb, DISCORD_TOKEN: "token" }, now);
+    assert.equal(mockDb.deadlines[0].alert_early_sent, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("completed or deleted deadlines stop all alerts", async () => {
+  const mockDb = createMockDb();
+  const now = 100000;
+  mockDb.deadlines.push({
+    id: 5,
+    guild_id: "guild_5",
+    channel_id: "channel_1",
+    course: "CS101",
+    title: "Essay",
+    due_timestamp: now + 1800,
+    is_completed: 1,
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
+  });
+
+  const originalFetch = globalThis.fetch;
+  let posted = false;
+  globalThis.fetch = async () => {
+    posted = true;
+    return new Response(JSON.stringify({ id: "msg" }), { status: 200 });
+  };
+
+  try {
+    await processDeadlineAlerts({ DB: mockDb, DISCORD_TOKEN: "token" }, now);
+    assert.equal(posted, false);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 
@@ -323,7 +801,11 @@ test("delete button allows deletion by creator", async () => {
     title: "Essay",
     due_timestamp: Math.floor(Date.now() / 1000) + 7200,
     is_completed: 0,
-    created_by: "user_creator"
+    created_by: "user_creator",
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
   });
 
   const interaction = {
@@ -350,7 +832,11 @@ test("delete button allows deletion by member with Manage Server permission", as
     title: "Project",
     due_timestamp: Math.floor(Date.now() / 1000) + 7200,
     is_completed: 0,
-    created_by: "user_other"
+    created_by: "user_other",
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
   });
 
   const interaction = {
@@ -376,7 +862,11 @@ test("delete button rejects deletion by unauthorized user with ephemeral message
     title: "Quiz",
     due_timestamp: Math.floor(Date.now() / 1000) + 7200,
     is_completed: 0,
-    created_by: "user_creator"
+    created_by: "user_creator",
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
   });
 
   const interaction = {
@@ -418,7 +908,11 @@ test("/deadline delete command removes deadline when authorized", async () => {
     title: "Term Paper",
     due_timestamp: Math.floor(Date.now() / 1000) + 7200,
     is_completed: 0,
-    created_by: "user_creator"
+    created_by: "user_creator",
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
   });
 
   const interaction = {
@@ -540,7 +1034,11 @@ test("/deadline list displays upcoming deadlines and flags overdue ones up to 7 
     course: "CS101",
     title: "Upcoming Project",
     due_timestamp: now + 86400,
-    is_completed: 0
+    is_completed: 0,
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
   });
 
   mockDb.deadlines.push({
@@ -550,7 +1048,11 @@ test("/deadline list displays upcoming deadlines and flags overdue ones up to 7 
     course: "CS101",
     title: "Overdue Quiz",
     due_timestamp: now - 3600,
-    is_completed: 0
+    is_completed: 0,
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
   });
 
   const interaction = {
@@ -580,7 +1082,11 @@ test("/deadline done marks deadline completed so it is omitted from future lists
     course: "NET201",
     title: "Lab Report",
     due_timestamp: Math.floor(Date.now() / 1000) + 7200,
-    is_completed: 0
+    is_completed: 0,
+    alert_early_sent: 0,
+    alert_second_sent: 0,
+    alert_overdue_sent: 0,
+    alert_failures: 0
   });
 
   const doneInteraction = {
